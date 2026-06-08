@@ -37,6 +37,38 @@ except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
 
 
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _as_positive_int(value, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _configure_pyav_reader_threads(reader, num_threads: int | None) -> None:
+    if num_threads is None:
+        return
+    container = getattr(reader, "container", None)
+    streams = getattr(container, "streams", None)
+    video_streams = getattr(streams, "video", [])
+    for stream in video_streams:
+        codec_context = getattr(stream, "codec_context", None)
+        if codec_context is not None and hasattr(codec_context, "thread_count"):
+            codec_context.thread_count = num_threads
+
+
 def get_frames_by_indices(
     video_path: str,
     indices: list[int] | np.ndarray,
@@ -240,12 +272,15 @@ def get_frames_by_timestamps(
     
     elif video_backend == "torchvision_av":
         torchvision.set_video_backend("pyav")
+        num_threads = _as_positive_int(video_backend_kwargs.get("num_threads", None))
+        gc_collect = _as_bool(video_backend_kwargs.get("gc_collect", False))
         loaded_frames = []
         loaded_ts = []
         
         reader = None
         try:
             reader = torchvision.io.VideoReader(video_path, "video")
+            _configure_pyav_reader_threads(reader, num_threads)
             
             for target_ts in timestamps:
                 # Reset reader state
@@ -286,9 +321,13 @@ def get_frames_by_timestamps(
             if reader is not None:
                 if hasattr(reader, '_c'):
                     reader._c = None
-                if hasattr(reader, 'container'):
-                    reader.container.close()
+                container = getattr(reader, 'container', None)
+                if container is not None:
+                    container.close()
                     reader.container = None
+            if gc_collect:
+                import gc
+                gc.collect()
         
         frames = np.array(loaded_frames)
         return frames.transpose(0, 2, 3, 1)

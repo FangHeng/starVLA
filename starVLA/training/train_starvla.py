@@ -463,19 +463,23 @@ class VLATrainer(TrainerUtils):
     def _finalize_training(self):
         """Training end processing."""
         if self.accelerator.is_main_process:
-            save_format = getattr(self.config.trainer, "save_format", "pt")
-            final_checkpoint = os.path.join(self.config.output_dir, "final_model")
-            os.makedirs(final_checkpoint, exist_ok=True)
-            state_dict = self.accelerator.get_state_dict(self.model)
-            if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
-            elif save_format == "pt":
-                torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+            skip_final_save = _cfg_get(self.config.trainer, "skip_final_save", False)
+            if skip_final_save:
+                logger.info("Skipping final model save because trainer.skip_final_save is enabled.")
             else:
-                raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
-            logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+                save_format = getattr(self.config.trainer, "save_format", "pt")
+                final_checkpoint = os.path.join(self.config.output_dir, "final_model")
+                os.makedirs(final_checkpoint, exist_ok=True)
+                state_dict = self.accelerator.get_state_dict(self.model)
+                if save_format == "safetensors":
+                    from safetensors.torch import save_file
+
+                    save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
+                elif save_format == "pt":
+                    torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+                else:
+                    raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+                logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         if self.accelerator.is_main_process and wandb.run is not None:
             wandb.finish()

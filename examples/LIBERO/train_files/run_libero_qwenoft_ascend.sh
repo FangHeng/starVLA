@@ -59,28 +59,37 @@ BASE_VLM="${BASE_VLM:-/home/hfang/public_datasets/starVLA/Pretrained_models/Qwen
 DATA_ROOT_DIR="${DATA_ROOT_DIR:-/home/hfang/public_datasets/starVLA/Datasets/LEROBOT_LIBERO_DATA}"
 DATA_MIX="${DATA_MIX:-libero_all}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-16}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-80000}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-100}"
 LOGGING_FREQUENCY="${LOGGING_FREQUENCY:-100}"
 RUN_ROOT_DIR="${RUN_ROOT_DIR:-/home/hfang/output/VLA_Ascend}"
 RUN_ID="${RUN_ID:-libero_qwenoft_ascend}"
+SKIP_FINAL_SAVE="${SKIP_FINAL_SAVE:-false}"
 
 mkdir -p "${RUN_ROOT_DIR}/${RUN_ID}"
 
 "${PYTHON_BIN}" -m accelerate.commands.launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
   --num_processes "${NUM_PROCESSES:-8}" \
-  starVLA/training/train_starvla.py \
+  -m \
+  starVLA.training.train_starvla \
   --config_yaml "${CONFIG_YAML}" \
   --framework.name QwenOFT \
   --framework.qwenvl.base_vlm "${BASE_VLM}" \
   --datasets.vla_data.data_root_dir "${DATA_ROOT_DIR}" \
   --datasets.vla_data.data_mix "${DATA_MIX}" \
   --datasets.vla_data.per_device_batch_size "${PER_DEVICE_BATCH_SIZE}" \
+  --datasets.vla_data.num_workers "${NUM_WORKERS}" \
+  --datasets.vla_data.prefetch_factor "${PREFETCH_FACTOR}" \
+  --datasets.vla_data.persistent_workers "${PERSISTENT_WORKERS}" \
   --trainer.max_train_steps "${MAX_TRAIN_STEPS}" \
   --trainer.save_interval "${SAVE_INTERVAL}" \
   --trainer.eval_interval "${EVAL_INTERVAL}" \
   --trainer.logging_frequency "${LOGGING_FREQUENCY}" \
+  --trainer.skip_final_save "${SKIP_FINAL_SAVE}" \
   --run_root_dir "${RUN_ROOT_DIR}" \
   --run_id "${RUN_ID}"

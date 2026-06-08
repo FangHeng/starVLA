@@ -6,7 +6,14 @@
 from typing import Optional
 
 import torch
+from starVLA.model.modules.vlm.ascend_patch_embed import linearize_qwen_vision_patch_embed
+from starVLA.model.modules.vlm.model_loading import (
+    call_qwen_backbone_without_lm_head,
+    resolve_model_id_and_load_kwargs,
+    resolve_torch_dtype,
+)
 from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (GPU / NPU)
+from starVLA.training.device_utils import get_autocast_context
 from starVLA.training.trainer_utils import initialize_overwatch
 from transformers import AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -56,10 +63,11 @@ class _QWen3_5_VL_Interface(nn.Module):
         super().__init__()
 
         qwenvl_config = config.framework.get("qwenvl", {})
-        model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
+        raw_model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
+        model_id, load_kwargs = resolve_model_id_and_load_kwargs(raw_model_id)
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        model_dtype = resolve_torch_dtype(qwenvl_config.get("model_dtype", "bfloat16"))
 
-        attn_implementation = "sdpa"
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
             if not has_flash_attn():
@@ -69,9 +77,16 @@ class _QWen3_5_VL_Interface(nn.Module):
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_id,
             attn_implementation=attn_implementation,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
+            **load_kwargs,
         )
-        processor = AutoProcessor.from_pretrained(model_id)
+        if bool(qwenvl_config.get("linearize_vision_patch_embed", False)):
+            if linearize_qwen_vision_patch_embed(model):
+                logger.info("Linearized Qwen3.5-VL vision patch embedding for Ascend NPU compatibility.")
+            else:
+                logger.warning("Requested Qwen3.5-VL patch embed linearization, but no Conv3d patch embed was found.")
+
+        processor = AutoProcessor.from_pretrained(model_id, **load_kwargs)
         processor.tokenizer.padding_side = "left"
 
         self.model = model
@@ -93,11 +108,15 @@ class _QWen3_5_VL_Interface(nn.Module):
         """
         Forward pass delegating to underlying Qwen3.5-VL backbone.
         """
+        skip_lm_head = bool(kwargs.pop("skip_lm_head", False))
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            outputs = self.model(
-                **kwargs,
-            )
+        with get_autocast_context(self.model.device, dtype=torch.bfloat16):
+            if skip_lm_head:
+                outputs = call_qwen_backbone_without_lm_head(self.model, kwargs)
+            else:
+                outputs = self.model(
+                    **kwargs,
+                )
 
         return outputs
 
@@ -113,7 +132,7 @@ class _QWen3_5_VL_Interface(nn.Module):
         Returns:
             GenerateOutput | Model-dependent generation return.
         """
-        with torch.autocast("cuda", dtype=torch.float16):
+        with get_autocast_context(self.model.device, dtype=torch.float16):
             generation_output = self.model.generate(
                 **kwargs,
             )

@@ -41,6 +41,7 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import add_discretized_state_to_instruction, merge_framework_config
 from starVLA.model.modules.action_model.MLP_ActionHeader import get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
+from starVLA.training.device_utils import get_autocast_context
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 
@@ -180,18 +181,19 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with get_autocast_context(qwen_inputs["input_ids"].device, dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
+                skip_lm_head=True,
             )
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
 
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
+        with get_autocast_context(last_hidden.device, dtype=torch.float32):
             # Extract action token embeddings as action prediction queries
             input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(
@@ -253,18 +255,19 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with get_autocast_context(qwen_inputs["input_ids"].device, dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
+                skip_lm_head=True,
             )
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
 
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
+        with get_autocast_context(last_hidden.device, dtype=torch.float32):
             # Extract action token embeddings as action prediction queries
             input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(
@@ -272,7 +275,7 @@ class Qwenvl_OFT(baseframework):
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        normalized_actions = pred_actions.detach().float().cpu().numpy()
         return {"normalized_actions": normalized_actions}
 
     def _gather_action_token_embeddings(
@@ -324,10 +327,10 @@ class Qwenvl_OFT(baseframework):
         # Sort in temporal order
         selected_pos = topk_pos.sort(dim=-1).values  # [B, chunk_len]
 
-        # Gather
-        expanded_index = selected_pos.unsqueeze(-1).expand(-1, -1, H)  # [B, chunk_len, H]
-        action_queries = last_hidden.gather(dim=1, index=expanded_index)  # [B, chunk_len, H]
-        return action_queries
+        selector = (torch.arange(L, device=device).view(1, 1, L) == selected_pos.unsqueeze(-1)).to(
+            dtype=last_hidden.dtype
+        )
+        return torch.bmm(selector, last_hidden)
 
     # Discretised state → instruction prefix (π₀.5 style); shared with QwenPI_v3.
     add_discretized_state_to_instruction = staticmethod(add_discretized_state_to_instruction)

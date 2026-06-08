@@ -34,7 +34,7 @@ except ImportError:
 import wandb
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, GradientAccumulationPlugin, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -44,11 +44,39 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
+from starVLA.training.device_utils import (
+    apply_ascend_patches_from_env,
+    build_adamw_optimizer,
+    get_autocast_context,
+    raise_for_non_finite_loss,
+    should_check_non_finite_loss,
+    should_run_step_interval_event,
+)
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
-from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
+from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, normalize_dotlist_args
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+
+def _env_flag_enabled(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def build_accelerator() -> Accelerator:
+    if _env_flag_enabled("ACCELERATE_USE_DEEPSPEED", "0"):
+        grad_accum_steps = os.environ.get("ACCELERATE_GRADIENT_ACCUMULATION_STEPS", "1")
+        grad_accum_steps = int(grad_accum_steps) if str(grad_accum_steps).isdigit() else 1
+        return Accelerator(
+            deepspeed_plugin=DeepSpeedPlugin(),
+            gradient_accumulation_plugin=GradientAccumulationPlugin(
+                num_steps=grad_accum_steps,
+                sync_each_batch=True,
+            ),
+        )
+
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    return Accelerator(kwargs_handlers=[ddp_kwargs])
+
+
+accelerator = build_accelerator()
 accelerator.print(accelerator.state)
 
 # Sane Defaults
@@ -56,6 +84,25 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Initialize logger
 logger = get_logger(__name__)
+
+
+def _dist_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _dist_barrier() -> None:
+    if _dist_is_initialized():
+        dist.barrier()
+
+
+def _is_rank_zero() -> bool:
+    return not _dist_is_initialized() or dist.get_rank() == 0
+
+
+def _cfg_get(obj, key, default=None):
+    if hasattr(obj, "get"):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 def load_fast_tokenizer():
@@ -80,20 +127,22 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
-    dist.barrier()
+    _dist_barrier()
     return vla_train_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
     """Set optimizer and scheduler."""
     param_groups = build_param_lr_groups(model=model, cfg=cfg)
-    optimizer = torch.optim.AdamW(
+    optimizer = build_adamw_optimizer(
         param_groups,
+        name=_cfg_get(cfg.trainer.optimizer, "name", None),
         lr=cfg.trainer.learning_rate.base,
         betas=tuple(cfg.trainer.optimizer.betas),
         weight_decay=cfg.trainer.optimizer.weight_decay,
         eps=cfg.trainer.optimizer.eps,
-        fused=True,
+        foreach=_cfg_get(cfg.trainer.optimizer, "foreach", None),
+        fused=_cfg_get(cfg.trainer.optimizer, "fused", None),
     )
 
     if dist.is_initialized() and dist.get_rank() == 0:
@@ -273,13 +322,14 @@ class VLATrainer(TrainerUtils):
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
+        if self.completed_steps % self.config.trainer.logging_frequency == 0 and _is_rank_zero():
             last_lrs = self.lr_scheduler.get_last_lr()
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
             metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-            wandb.log(metrics, step=self.completed_steps)
+            if wandb.run is not None:
+                wandb.log(metrics, step=self.completed_steps)
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _create_data_iterators(self):
@@ -331,14 +381,14 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            if should_run_step_interval_event(self.completed_steps, self.config.trainer.eval_interval):
                 step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if should_run_step_interval_event(self.completed_steps, self.config.trainer.save_interval):
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -362,7 +412,7 @@ class VLATrainer(TrainerUtils):
             step_metrics["mse_score"] = score / num_pots
 
         del examples
-        dist.barrier()
+        _dist_barrier()
         return step_metrics
 
     def _log_training_config(self):
@@ -379,11 +429,19 @@ class VLATrainer(TrainerUtils):
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with get_autocast_context(self.accelerator.device, dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
                 total_loss = action_loss
 
+            non_finite_check_interval = _cfg_get(self.config.trainer, "non_finite_check_interval", 1)
+            non_finite_check_warmup_steps = _cfg_get(self.config.trainer, "non_finite_check_warmup_steps", 0)
+            if should_check_non_finite_loss(
+                step=self.completed_steps,
+                interval=non_finite_check_interval,
+                warmup_steps=non_finite_check_warmup_steps,
+            ):
+                raise_for_non_finite_loss(total_loss, step=self.completed_steps)
             self.accelerator.backward(total_loss)
 
             if self.config.trainer.gradient_clipping is not None:
@@ -419,7 +477,7 @@ class VLATrainer(TrainerUtils):
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and wandb.run is not None:
             wandb.finish()
 
         self.accelerator.wait_for_everyone()
@@ -430,6 +488,7 @@ def main(cfg) -> None:
 
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+    apply_ascend_patches_from_env(accelerator.device, logger=logger)
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
@@ -449,8 +508,9 @@ def main(cfg) -> None:
     trainer.train()
 
     logger.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
+    _dist_barrier()
+    if _dist_is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

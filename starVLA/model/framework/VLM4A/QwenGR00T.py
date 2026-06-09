@@ -36,6 +36,7 @@ from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingActionHead, get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+from starVLA.training.device_utils import get_autocast_context, normalize_device_type
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 
@@ -178,8 +179,7 @@ class Qwen_GR00T(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with get_autocast_context(qwen_inputs["input_ids"].device, dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -190,7 +190,7 @@ class Qwen_GR00T(baseframework):
             last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
 
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
+        with get_autocast_context(last_hidden.device, dtype=torch.float32):
             actions = torch.tensor(
                 np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
             )  # [B, T_full, action_dim]
@@ -203,10 +203,6 @@ class Qwen_GR00T(baseframework):
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
-            if backbone_attention_mask is not None:
-                backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(
-                    dtype=torch.bool
-                )
 
             state_repeated = None
             if state is not None:
@@ -214,8 +210,7 @@ class Qwen_GR00T(baseframework):
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
             action_loss = self.action_model(
-                last_hidden_repeated, actions_target_repeated, state_repeated,
-                encoder_attention_mask=backbone_attention_mask,
+                last_hidden_repeated, actions_target_repeated, state_repeated
             )  # (B, chunk_len, action_dim)
 
         return {"action_loss": action_loss}
@@ -248,10 +243,7 @@ class Qwen_GR00T(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-        if backbone_attention_mask is not None:
-            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with get_autocast_context(qwen_inputs["input_ids"].device, dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
@@ -269,10 +261,8 @@ class Qwen_GR00T(baseframework):
         )
 
         # Step 4: Action Expert Forward
-        with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(
-                last_hidden, state, encoder_attention_mask=backbone_attention_mask
-            )  # (B, chunk_len, action_dim)
+        with get_autocast_context(last_hidden.device, dtype=torch.float32):
+            pred_actions = self.action_model.predict_action(last_hidden, state)  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
@@ -315,7 +305,7 @@ if __name__ == "__main__":
     sample2["lang"] = "Another fake instruction for testing."
 
     batch = [sample, sample2]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(normalize_device_type())
     model = model.to(device)
     forward_output = model(batch)
     action_loss = forward_output["action_loss"]

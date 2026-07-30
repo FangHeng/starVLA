@@ -187,7 +187,7 @@ class Qwenvl_OFT(baseframework):
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
-                skip_lm_head=True,
+                logits_to_keep=1,
             )
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
@@ -261,7 +261,7 @@ class Qwenvl_OFT(baseframework):
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
-                skip_lm_head=True,
+                logits_to_keep=1,
             )
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
